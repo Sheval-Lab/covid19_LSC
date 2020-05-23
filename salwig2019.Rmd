@@ -1,0 +1,142 @@
+---
+title: "Salwig et al., 2019"
+output: html_notebook
+---
+
+Load libraries required for the further analysis.
+```{r message=FALSE}
+library(tidyverse)
+library(data.table)
+library(reshape2)
+library(DESeq2)
+library(ggrepel)
+```
+
+Load raw counts provided with the paper. Convert counts to TPM using pre-computed file with gene length info from Ensembl v90 gene annotation.
+```{r}
+salwig.data <- fread("salwig/GSE129440_counts.matrix.norm_anno.txt.gz")
+colnames(salwig.data)[1:3] <- c("gene_id", "gene_name", "gene_type")
+
+mouse_gene_length <- fread("Mus_musculus.GRCm38.90.exons_merged.gene_length.txt", 
+                           col.names=c("gene_id", "gene_length"))
+
+salwig.counts_glength <- merge(mouse_gene_length, salwig.data[,c(1,19:24)], by="gene_id", all.x=F, all.y=T) 
+
+salwig.counts_m <- as.matrix(salwig.counts_glength[,-c(1:2)])
+rownames(salwig.counts_m) <- salwig.counts_glength$gene_id
+salwig.counts.rpk <- colSums(salwig.counts_m/salwig.counts_glength$gene_length)
+salwig.counts.tpm <- t(t(salwig.counts_m/salwig.counts_glength$gene_length)/
+                                     salwig.counts.rpk)*(10^6)
+```
+
+Create a heatmap of virus entry factors' TPM values.
+```{r}
+receptors.m <- c("ENSMUSG00000015405", "ENSMUSG00000000385", "ENSMUSG00000030530", "ENSMUSG00000039062",
+                 "ENSMUSG00000035000", "ENSMUSG00000023175")
+
+salwig.counts.tpm %>% as.data.frame() %>% mutate(gene_id = row.names(.)) %>% 
+  filter(gene_id %in% receptors.m) %>% merge(., salwig.data[,1:2], by="gene_id", all=F) %>% 
+  select(!gene_id) %>% reshape2::melt() %>% 
+  mutate(sample = factor(variable, levels = c("BASC_1", "BASC_2", "AT2_1", "AT2_2", "Club_1", "Club_2")),
+         gene_name = factor(gene_name, levels = rev(c("Ace2", "Tmprss2", "Furin", "Anpep", "Dpp4", "Bsg")))) %>% 
+  ggplot() + 
+  geom_tile(mapping=aes(x=sample, y=gene_name, fill=log2(value+1)), color="grey") + theme_minimal() +
+  labs(x="", y="", fill="log2(TPM+1)") + scale_fill_gradientn(colors=c("cornflowerblue", "yellow", "red")) +
+  geom_text(aes(x=sample, y=gene_name, label = round(value, 1))) + 
+  theme(axis.text = element_text(size=12))
+# ggsave("salwig/plots/salwig_TPM.hm.png", width=7, height=4, dpi=300)
+```
+
+
+Perform differential gene expression analysis with DESeq2.
+```{r}
+mouse.pheno <- data.frame(sample=rep(c("AT2", "BASC", "Club"), each=2),
+                          row.names=colnames(salwig.counts_m))
+
+salwig.dds <- DESeqDataSetFromMatrix(salwig.counts_m, mouse.pheno, design = ~sample)
+salwig.dds <- DESeq2::estimateSizeFactors(salwig.dds)
+
+# run PCA
+salwig.pca <- plotPCA(vst(salwig.dds), intgroup='sample', returnData=T)
+pca_plot <- ggplot(salwig.pca, aes(PC1, PC2, color=sample), cex.lab=cex, cex=cex) + geom_point(size=4) + 
+  xlab(paste0("PC1: ", round(100*attr(salwig.pca, 'percentVar'))[1],"% variance")) + 
+  ylab(paste0("PC2: ", round(100*attr(salwig.pca, 'percentVar'))[2], "% variance")) + 
+  guides(color=guide_legend(title=NULL)) +
+  theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.position="top")
+pca_plot + coord_fixed(ratio = 3) 
+
+# run DEA
+salwig.dds <- DESeq(salwig.dds)
+salwig.ncounts <- DESeq2::counts(salwig.dds, normalized=T) %>% as.data.frame() %>% 
+  mutate(gene_id=row.names(.))
+```
+
+
+Analyse BASC vs AT2 & BASC vs Club comparisons. Visualize the results with volcano plots.
+```{r}
+salwig.BASC_vs_AT2 <- results(salwig.dds, contrast=c("sample", "BASC", "AT2"), alpha=0.05) %>% 
+  as.data.frame() %>% 
+  mutate(gene_id = rownames(.), FC = 2^log2FoldChange) %>%
+  filter(!is.na(padj)) %>% 
+  merge(., salwig.data[,1:3], by="gene_id", all=F) %>% 
+  dplyr::select(gene_id, gene_name, gene_type, stat, padj, log2FC = log2FoldChange, FC) %>% 
+  merge(., salwig.ncounts, by="gene_id", all=F) %>% 
+  arrange(desc(stat))
+# fwrite(salwig.BASC_vs_AT2, "salwig/salwig.BASC_vs_AT2.res.txt", sep="\t")
+
+salwig.BASC_vs_Club <- results(salwig.dds, contrast=c("sample", "BASC", "Club"), alpha=0.05) %>% 
+  as.data.frame() %>% 
+  mutate(gene_id = rownames(.), FC = 2^log2FoldChange) %>%
+  filter(!is.na(padj)) %>% 
+  merge(., salwig.data[,1:3], by="gene_id", all=F) %>% 
+  dplyr::select(gene_id, gene_name, gene_type, stat, padj, log2FC = log2FoldChange, FC) %>% 
+  merge(., salwig.ncounts, by="gene_id", all=F) %>% 
+  arrange(desc(stat))
+# fwrite(salwig.BASC_vs_Club, "salwig/salwig.BASC_vs_Club.res.txt", sep="\t")
+
+
+receptors.m <- c("Ace2", "Tmprss2", "Anpep", "Furin", "Dpp4")
+
+# BASC_vs_AT2 volcano plot
+plot1 <- ggplot() + 
+  geom_point(filter(salwig.BASC_vs_AT2, !(gene_name %in% receptors.m)),
+             mapping=aes(x=log2FC, y=-log10(padj)), color="grey", alpha=0.1) +
+  geom_point(filter(salwig.BASC_vs_AT2, gene_name %in% receptors.m, padj>0.05), 
+             mapping=aes(x=log2FC, y=-log10(padj)), color="pink") +
+  geom_point(filter(salwig.BASC_vs_AT2, gene_name %in% receptors.m, padj<0.05), 
+             mapping=aes(x=log2FC, y=-log10(padj)), color="red") +
+  geom_vline(xintercept = 0, linetype="dashed", color="darkgrey") +
+  geom_hline(yintercept = -log10(0.05), linetype="dashed", color="darkgrey") +
+  geom_text_repel(filter(salwig.BASC_vs_AT2, gene_name %in% receptors.m, log2FC > 0), 
+             mapping=aes(x=log2FC, y=-log10(padj), label=gene_name), size = 3, nudge_x = 0.5) +
+  geom_text_repel(filter(salwig.BASC_vs_AT2, gene_name %in% receptors.m, log2FC < 0), 
+             mapping=aes(x=log2FC, y=-log10(padj), label=gene_name), size = 3, nudge_x = -0.5) +
+  xlim(c(-4,4)) + ylim(c(0, 7)) +
+  theme_classic() + theme(axis.text = element_text(color = "black"), aspect.ratio=1, text = element_text(size = 10)) +  
+  ggtitle(label = "BASC vs AT2") + labs(x=expression(log[2]~("Fold change")), y=expression(-log[10]~(p.adjusted)))
+
+# BASC_vs_Club volcano plot
+plot2 <- ggplot() + 
+  geom_point(filter(salwig.BASC_vs_Club, !(gene_name %in% receptors.m)),
+             mapping=aes(x=log2FC, y=-log10(padj)), color="grey", alpha=0.1) +
+  geom_point(filter(salwig.BASC_vs_Club, gene_name %in% receptors.m, padj>0.05), 
+             mapping=aes(x=log2FC, y=-log10(padj)), color="pink") +
+  geom_point(filter(salwig.BASC_vs_Club, gene_name %in% receptors.m, padj<0.05), 
+             mapping=aes(x=log2FC, y=-log10(padj)), color="red") +
+  geom_vline(xintercept = 0, linetype="dashed", color="darkgrey") +
+  geom_hline(yintercept = -log10(0.05), linetype="dashed", color="darkgrey") +
+  geom_text_repel(filter(salwig.BASC_vs_Club, gene_name %in% receptors.m[-5], log2FC > 0), 
+             mapping=aes(x=log2FC, y=-log10(padj), label=gene_name), size = 3, nudge_x = 1) +
+  geom_text_repel(filter(salwig.BASC_vs_Club, gene_name %in% receptors.m[5]), 
+             mapping=aes(x=log2FC, y=-log10(padj), label=gene_name), size = 3) +
+  geom_text_repel(filter(salwig.BASC_vs_Club, gene_name %in% receptors.m, log2FC < 0), 
+             mapping=aes(x=log2FC, y=-log10(padj), label=gene_name), size = 3, nudge_x = -0.5) +
+  xlim(c(-4,4)) + ylim(c(0, 85)) +
+  theme_classic() + theme(axis.text = element_text(color = "black"), aspect.ratio=1, text = element_text(size = 10)) + 
+  ggtitle(label = "BASC vs Club") + labs(x=expression(log[2]~("Fold change")), y=expression(-log[10]~(p.adjusted)))
+
+# Combine two volcano plots
+plot1 + plot2
+# ggsave("salwig/plots/salwig.vlc.png", width = 6, height=3, dpi=300)
+```
+

@@ -1,0 +1,311 @@
+---
+title: "Montoro et al., 2018"
+output: html_notebook
+---
+
+Load libraries required for the further analysis.
+```{r message=FALSE}
+library(tidyverse)
+library(data.table)
+library(scales)
+library(ggpubr)
+library(ggrepel)
+library(Seurat)
+library(patchwork)
+```
+
+Load the datasets: droplet-based 3′ scRNA-seq (7193 cells) and full-length scRNA-seq (301 cells).
+3′ scRNA-seq expression table contains UMI counts.
+Full-length scRNA-seq expression table countains TPM values (obtained by RSEM).
+```{r}
+# 3' scRNA-seq
+# load meta data
+montoro.3end.meta <- fread("montoro/trachea.mouse.metadata.txt")[-1,]
+row.names(montoro.3end.meta) <- montoro.3end.meta$NAME
+
+# load expression data (nUMI) and create an expression matrix
+montoro.3end.data <- fread("montoro/GSE103354_Trachea_droplet_UMIcounts.txt.gz")
+montoro.3end.data_m <- as.matrix(montoro.3end.data[,-1])
+rownames(montoro.3end.data_m) <- montoro.3end.data$V1
+colnames(montoro.3end.data_m) <- montoro.3end.meta$NAME
+
+
+# full-length scRNA-seq
+# load expression data (TPM) and create an expression matrix
+montoro.fullLength.data <- fread("montoro/GSE103354_Trachea_fullLength_TPM.txt.gz")
+# convert TPM to TP10K and log-transform
+montoro.fullLength.data_m <- log1p(as.matrix(montoro.fullLength.data[,-1])/100)
+rownames(montoro.fullLength.data_m) <- montoro.fullLength.data$V1
+
+# create table with meta data
+montoro.fullLength.meta <- data.frame(plate=colnames(montoro.fullLength.data_m), 
+                                      cluster=unlist(tstrsplit(colnames(montoro.fullLength.data_m), "_", keep=4)),
+                                      row.names=colnames(montoro.fullLength.data_m))
+```
+
+
+Create Seurat objects for two datasets.
+```{r}
+montoro.3end.seurat <- CreateSeuratObject(log1p(t(t(montoro.3end.data_m)/colSums(montoro.3end.data_m))*10000), 
+                                          project="3' scRNA-seq", meta.data=montoro.3end.meta)
+Idents(montoro.3end.seurat) <- montoro.3end.seurat@meta.data$cluster
+
+
+montoro.fullLength.seurat <- CreateSeuratObject(montoro.fullLength.data_m, 
+                                                project="full-length scRNA-seq", meta.data=montoro.fullLength.meta)
+Idents(montoro.fullLength.seurat) <- montoro.fullLength.seurat@meta.data$cluster
+```
+
+Calculate average expression values and percent of expressing cells for two datasets.
+Plot average gene expression values distribution and percent of expressing cells to compare two datasets.
+```{r}
+montoro.3end.avg <- DotPlot(montoro.3end.seurat, features = rownames(montoro.3end.seurat))$data %>% 
+  transmute(gene = features.plot, id, avg.exp = log1p(avg.exp), pct.exp)
+montoro.fullLength.avg <- DotPlot(montoro.fullLength.seurat, features = rownames(montoro.fullLength.seurat))$data %>% 
+  transmute(gene = features.plot, id, avg.exp = log1p(avg.exp), pct.exp)
+# fwrite(montoro.3end.avg, "montoro/montoro.3end.avg.txt", sep="\t")
+# fwrite(montoro.fullLength.avg, "montoro/montoro.fullLength.avg.txt", sep="\t")
+
+montoro.avg_2exp <- merge(montoro.3end.avg, montoro.fullLength.avg, by = c("gene", "id"), all = FALSE,
+                          suffixes = c(".3end", ".fullLength"))
+# fwrite(montoro.avg_2exp, "montoro/montoro.avg_2exp.txt", sep="\t")
+
+# select only large cell clusters: Basal cell, Ciliated cell, and Secretory club cell
+montoro.avg_2exp.3clusters <- filter(montoro.avg_2exp, id %in% c("Basal", "Ciliated", "Club")) %>% 
+  mutate(id = factor(id, levels = c("Basal", "Club", "Ciliated")))
+
+# add average non-zero expression
+montoro.3end.sizes <- table(Idents(montoro.3end.seurat)) %>% as.data.frame() %>% 
+  rename(id = Var1, nCells.3end = Freq) %>% 
+  filter(id %in% c("Basal", "Club", "Ciliated"))
+montoro.fullLength.sizes <- table(Idents(montoro.fullLength.seurat)) %>% as.data.frame() %>% 
+  rename(id = Var1, nCells.fullLength = Freq) %>% 
+  filter(id %in% c("Basal", "Club", "Ciliated"))
+
+montoro.avg_2exp.3clusters_nonzero <- merge(montoro.avg_2exp.3clusters, 
+                                            merge(montoro.3end.sizes, montoro.fullLength.sizes, by = "id"),
+                                            by = "id", all = TRUE) %>% 
+  mutate(avg.nonzero.exp.3end = log1p(expm1(avg.exp.3end) * nCells.3end / (pct.exp.3end * nCells.3end / 100)), 
+         avg.nonzero.exp.3end = ifelse(is.nan(avg.nonzero.exp.3end), 0, avg.nonzero.exp.3end),
+         avg.nonzero.exp.fullLength = log1p(expm1(avg.exp.fullLength) * nCells.fullLength / 
+                                              (pct.exp.fullLength * nCells.fullLength / 100)), 
+         avg.nonzero.exp.fullLength = ifelse(is.nan(avg.nonzero.exp.fullLength), 0, avg.nonzero.exp.fullLength))
+# fwrite(montoro.avg_2exp.3clusters_nonzero, "montoro/montoro.avg_2exp.3clusters_nonzero.txt", sep="\t")
+```
+
+Plot average gene expression values distribution to compare two datasets.
+```{r}
+# plot average gene expression
+ggplot(montoro.avg_2exp.3clusters, aes(x=avg.exp.3end, y=avg.exp.fullLength)) + geom_hex(bins = 100) +
+  theme_classic() + scale_x_log10(label = label_number(), name = "3' scRNA-seq average log(TPM+1)") + 
+  scale_y_log10(label = label_number(), name = "full-length scRNA-seq average log(TPM+1)") + 
+  scale_fill_gradientn(colours = c("darkblue", "pink")) +
+  stat_cor(method = "pearson") +
+  geom_abline(intercept = 0, slope = 1, linetype="dashed", size=2, color="darkgrey") + coord_fixed()
+# ggsave("montoro/plots/montoro.exp_corr.hex.png", width=7, height=5, dpi=300)
+
+
+# highlight virus entry factor genes
+receptors.m <- c("Ace2", "Tmprss2", "Furin", "Anpep", "Dpp4")
+ggplot(montoro.avg_2exp.3clusters, aes(x=avg.exp.3end, y=avg.exp.fullLength)) + geom_point(size=1, alpha=0.3, color="grey") +
+  theme_classic() + scale_x_log10(label = label_number(), name = "3' scRNA-seq average log(TPM+1)") + 
+  scale_y_log10(label = label_number(), name = "full-length scRNA-seq average log(TPM+1)") + 
+  stat_cor(method = "pearson", label.y=log10(0.00003), label.x=log10(0.005), color = "black") +
+  geom_abline(intercept = 0, slope = 1, linetype="dashed", size=1, color="darkgrey") +
+  coord_fixed() +
+  theme(legend.position = "none", axis.text = element_text(color = "black"), aspect.ratio=1) +
+  facet_wrap(~id, ncol = 3, drop=TRUE) +
+  # assign colors to virus entry factor genes, and add text labels
+  geom_point(filter(montoro.avg_2exp.3clusters, id=="Basal", gene %in% receptors.m), 
+             mapping = aes(x=avg.exp.3end, y=avg.exp.fullLength),
+             color="#F8766D", size=2) + 
+  geom_point(filter(montoro.avg_2exp.3clusters, id=="Club", gene %in% receptors.m), 
+             mapping = aes(x=avg.exp.3end, y=avg.exp.fullLength),
+             color="#00BA38", size=2) + 
+  geom_point(filter(montoro.avg_2exp.3clusters, id=="Ciliated", gene %in% receptors.m), 
+             mapping = aes(x=avg.exp.3end, y=avg.exp.fullLength),
+             color="#619CFF", size=2) + 
+  geom_text_repel(filter(montoro.avg_2exp.3clusters, gene %in% receptors.m), 
+             mapping = aes(x=avg.exp.3end, y=avg.exp.fullLength, label=gene))
+# ggsave("montoro/plots/montoro.exp_corr.3clusters.point2.png", width=12, height=4, dpi=300)
+
+# mean NON-ZERO expression
+ggplot(montoro.avg_2exp.3clusters_nonzero, aes(x=avg.nonzero.exp.3end, y=avg.nonzero.exp.fullLength)) + 
+  geom_point(size=1, alpha=0.3, color="grey") +
+  theme_classic() + scale_x_log10(label = label_number(), name = "3' scRNA-seq average non-zero log(TPM+1)") + 
+  scale_y_log10(label = label_number(), name = "full-length scRNA-seq\naverage non-zero log(TPM+1)") + 
+  # stat_cor(method = "pearson", label.y=log10(0.00003), label.x=log10(0.005), color = "black") +
+  geom_abline(intercept = 0, slope = 1, linetype="dashed", size=1, color="darkgrey") +
+  coord_fixed() +
+  theme(legend.position = "none", axis.text = element_text(color = "black"), aspect.ratio=1, 
+        axis.title = element_text(size = 13), strip.text = element_text(size = 13)) +
+  facet_wrap(~id, ncol = 3, drop=TRUE) +
+  # assign colors to virus entry factor genes, and add text labels
+  geom_point(filter(montoro.avg_2exp.3clusters_nonzero, id=="Basal", gene %in% receptors.m), 
+             mapping = aes(x=avg.nonzero.exp.3end, y=avg.nonzero.exp.fullLength),
+             color="#F8766D", size=2) + 
+  geom_point(filter(montoro.avg_2exp.3clusters_nonzero, id=="Club", gene %in% receptors.m), 
+             mapping = aes(x=avg.nonzero.exp.3end, y=avg.nonzero.exp.fullLength),
+             color="#00BA38", size=2) + 
+  geom_point(filter(montoro.avg_2exp.3clusters_nonzero, id=="Ciliated", gene %in% receptors.m), 
+             mapping = aes(x=avg.nonzero.exp.3end, y=avg.nonzero.exp.fullLength),
+             color="#619CFF", size=2) + 
+  geom_text_repel(filter(montoro.avg_2exp.3clusters_nonzero, gene %in% receptors.m), 
+             mapping = aes(x=avg.nonzero.exp.3end, y=avg.nonzero.exp.fullLength, label=gene))
+# ggsave("montoro/plots/montoro.exp_corr.3clusters.nonzero.point.png", width=12, height=4, dpi=300)
+```
+
+Plot percent of expressing cells to compare two datasets.
+```{r}
+# highlight virus entry factor genes
+receptors.m <- c("Ace2", "Tmprss2", "Furin", "Anpep", "Dpp4")
+ggplot(montoro.avg_2exp.3clusters, aes(x=pct.exp.3end, y=pct.exp.fullLength)) + geom_point(size=1, alpha=0.3, color="grey") +
+  theme_classic() + labs(x = "3' scRNA-seq % expressing cells", y = "full-length scRNA-seq % expressing cells") +  
+  # stat_cor(method = "pearson", label.y=5, label.x=35, color = "black") +
+  geom_abline(intercept = 0, slope = 1, linetype="dashed", size=1, color="darkgrey") +
+  coord_fixed() + theme(legend.position = "none", axis.text = element_text(color = "black"), aspect.ratio=1,
+                        axis.title = element_text(size = 13), strip.text = element_text(size = 13)) +
+  facet_wrap(~id, ncol = 3, drop=TRUE) +
+  # assign colors to virus entry factor genes, and add text labels
+  geom_point(filter(montoro.avg_2exp.3clusters, id=="Basal", gene %in% receptors.m), 
+             mapping = aes(x=pct.exp.3end, y=pct.exp.fullLength),
+             color="#F8766D", size=2) + 
+  geom_point(filter(montoro.avg_2exp.3clusters, id=="Club", gene %in% receptors.m), 
+             mapping = aes(x=pct.exp.3end, y=pct.exp.fullLength),
+             color="#00BA38", size=2) + 
+  geom_point(filter(montoro.avg_2exp.3clusters, id=="Ciliated", gene %in% receptors.m), 
+             mapping = aes(x=pct.exp.3end, y=pct.exp.fullLength),
+             color="#619CFF", size=2) + 
+  geom_text_repel(filter(montoro.avg_2exp.3clusters, gene %in% receptors.m), 
+             mapping = aes(x=pct.exp.3end, y=pct.exp.fullLength, label=gene))
+# ggsave("montoro/plots/montoro.pct_corr.3clusters.point2.png", width=12, height=4, dpi=300)
+```
+
+
+Inspect Ace2 and other entry factors (SEFs) average non-zero expression in 3' scRNA-seq.
+```{r}
+montoro.3end.ace2 <- DotPlot(montoro.3end.seurat, features = receptors.m)$data %>% 
+  filter(id %in% c("Basal", "Club", "Ciliated")) %>% 
+  transmute(gene = features.plot, id = factor(id, levels = rev(c("Basal", "Club", "Ciliated"))), 
+            avg.exp = log1p(avg.exp), pct.exp)
+# fwrite(montoro.3end.ace2, "montoro/montoro.3end.receptors.txt", sep="\t")
+
+montoro.3end.sizes <- table(Idents(montoro.3end.seurat)) %>% as.data.frame() %>% rename(id = Var1, nCells = Freq) %>% 
+  filter(id %in% c("Basal", "Club", "Ciliated"))
+
+montoro.3end.ace2_nonzero <- montoro.3end.ace2 %>% 
+  mutate(avg.exp = expm1(avg.exp)) %>% 
+  merge(., montoro.3end.sizes, by = "id", all = FALSE) %>% 
+  # calculate average non-zero expression  
+  mutate(avg.nonzero.exp = log1p(avg.exp * nCells / (pct.exp * nCells / 100)), avg.exp = log1p(avg.exp), 
+         avg.nonzero.exp = ifelse(is.nan(avg.nonzero.exp), 0, avg.nonzero.exp))
+# fwrite(montoro.3end.ace2_nonzero, "montoro/montoro.3end.ace2_nonzero.txt", sep="\t")
+
+levels(montoro.3end.ace2_nonzero$id) <- rev(c("Basal", "Club", "Ciliated"))
+```
+
+
+Inspect Ace2 and other entry factors (SEFs) average non-zero expression in full-length scRNA-seq.
+```{r}
+montoro.fullLength.ace2 <- DotPlot(montoro.fullLength.seurat, features = receptors.m)$data %>% 
+  filter(id %in% c("Basal", "Club", "Ciliated")) %>% 
+  transmute(gene = features.plot, id = factor(id, levels = rev(c("Basal", "Club", "Ciliated"))), 
+            avg.exp = log1p(avg.exp), pct.exp)
+# fwrite(montoro.fullLength.ace2, "montoro/montoro.fullLength.receptors.txt", sep="\t")
+
+
+montoro.fullLength.sizes <- table(Idents(montoro.fullLength.seurat)) %>% as.data.frame() %>% 
+  rename(id = Var1, nCells = Freq) %>% filter(id %in% c("Basal", "Club", "Ciliated"))
+
+montoro.fullLength.ace2_nonzero <- montoro.fullLength.ace2 %>% 
+  mutate(avg.exp = expm1(avg.exp)) %>% 
+  merge(., montoro.fullLength.sizes, by = "id", all = FALSE) %>% 
+  # calculate average non-zero expression  
+  mutate(avg.nonzero.exp = log1p(avg.exp * nCells / (pct.exp * nCells / 100)), avg.exp = log1p(avg.exp), 
+         avg.nonzero.exp = ifelse(is.nan(avg.nonzero.exp), 0, avg.nonzero.exp))
+# fwrite(montoro.fullLength.ace2_nonzero, "montoro/montoro.fullLength.ace2_nonzero.txt", sep="\t")
+
+levels(montoro.fullLength.ace2_nonzero$id) <- rev(c("Basal", "Club", "Ciliated"))
+```
+
+
+Create dotplots of SEF expression. Make same colorbar limits in 3' and fl dotplots.
+```{r}
+# 3' scRNA-seq
+plot1_3end <- ggplot(filter(montoro.3end.ace2_nonzero, gene %in% c("Ace2")), 
+                aes(x=gene, y=factor(id, levels = rev(c("Basal", "Club", "Ciliated"))), color=avg.nonzero.exp, size=pct.exp)) +
+  geom_point() +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nexpression\nlog(TPM+1)", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red", 
+                       limits = c(0, max(max(filter(montoro.3end.ace2_nonzero, gene %in% c("Ace2"))$avg.nonzero.exp),
+                                  max(filter(montoro.fullLength.ace2_nonzero, gene %in% c("Ace2"))$avg.nonzero.exp)))) +
+  scale_size_continuous(limits = c(0, max(max(filter(montoro.3end.ace2_nonzero, gene %in% c("Ace2"))$pct.exp),
+                                  max(filter(montoro.fullLength.ace2_nonzero, gene %in% c("Ace2"))$pct.exp))), 
+                        breaks = c(0,10,20,30)) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), axis.text = element_text(color = "black", size = 8), 
+        legend.title = element_text(size = 6),  legend.text = element_text(size = 6), legend.title.align = 0.5) +
+  guides(color = guide_colorbar(order = 1), size = guide_legend(order = 2))
+
+plot2_3end <- ggplot(filter(montoro.3end.ace2_nonzero, gene %in% c("Tmprss2", "Furin", "Anpep", "Dpp4")), 
+       aes(x=factor(gene, levels = c("Tmprss2", "Furin", "Anpep", "Dpp4")), 
+           y=factor(id, levels = rev(c("Basal", "Club", "Ciliated"))), color=avg.nonzero.exp, size=pct.exp)) +
+  geom_point() +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nexpression\nlog(TPM+1)", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red", 
+                       limits = c(0, max(max(montoro.3end.ace2_nonzero$avg.nonzero.exp),
+                                  max(montoro.fullLength.ace2_nonzero$avg.nonzero.exp)))) +
+  scale_size_continuous(limits = c(0, max(max(montoro.3end.ace2_nonzero$pct.exp),
+                                  max(montoro.fullLength.ace2_nonzero$pct.exp))), 
+                        breaks = c(0,25,50,75)) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), axis.text = element_text(color = "black", size = 8), 
+        legend.title = element_text(size = 6),  legend.text = element_text(size = 6), legend.title.align = 0.5) +
+  guides(color = guide_colorbar(order = 1), size = guide_legend(order = 2))
+
+plot1_3end + 
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3), 
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5)) + 
+  plot2_3end + 
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3), 
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5)) + 
+  plot_layout(widths = c(1, 2))
+# ggsave("montoro/plots/montoro.3end.receptors.nonzero.dp_sc.png", width=7, height=3, dpi=300)
+
+# full-length scRNA-seq
+plot1_fl <- ggplot(filter(montoro.fullLength.ace2_nonzero, gene %in% c("Ace2")), 
+                aes(x=gene, y=factor(id, levels = rev(c("Basal", "Club", "Ciliated"))), color=avg.nonzero.exp, size=pct.exp)) +
+  geom_point() +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nexpression\nlog(TPM+1)", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red", 
+                       limits = c(0, max(max(filter(montoro.3end.ace2_nonzero, gene %in% c("Ace2"))$avg.nonzero.exp),
+                                  max(filter(montoro.fullLength.ace2_nonzero, gene %in% c("Ace2"))$avg.nonzero.exp)))) +
+  scale_size_continuous(limits = c(0, max(max(filter(montoro.3end.ace2_nonzero, gene %in% c("Ace2"))$pct.exp),
+                                  max(filter(montoro.fullLength.ace2_nonzero, gene %in% c("Ace2"))$pct.exp))), 
+                        breaks = c(0,10,20,30)) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), axis.text = element_text(color = "black", size = 8), 
+        legend.title = element_text(size = 6),  legend.text = element_text(size = 6), legend.title.align = 0.5) +
+  guides(color = guide_colorbar(order = 1), size = guide_legend(order = 2))
+
+plot2_fl <- ggplot(filter(montoro.fullLength.ace2_nonzero, gene %in% c("Tmprss2", "Furin", "Anpep", "Dpp4")), 
+       aes(x=factor(gene, levels = c("Tmprss2", "Furin", "Anpep", "Dpp4")), 
+           y=factor(id, levels = rev(c("Basal", "Club", "Ciliated"))), color=avg.nonzero.exp, size=pct.exp)) +
+  geom_point() +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nexpression\nlog(TPM+1)", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red", 
+                       limits = c(0, max(max(montoro.3end.ace2_nonzero$avg.nonzero.exp),
+                                  max(montoro.fullLength.ace2_nonzero$avg.nonzero.exp)))) +
+  scale_size_continuous(limits = c(0, max(max(montoro.3end.ace2_nonzero$pct.exp),
+                                  max(montoro.fullLength.ace2_nonzero$pct.exp))), 
+                        breaks = c(0,25,50,75)) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), axis.text = element_text(color = "black", size = 8), 
+        legend.title = element_text(size = 6),  legend.text = element_text(size = 6), legend.title.align = 0.5) +
+  guides(color = guide_colorbar(order = 1), size = guide_legend(order = 2))
+
+plot1_fl + 
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3), 
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5)) + 
+  plot2_fl + 
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3), 
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5)) + 
+  plot_layout(widths = c(1, 2))
+# ggsave("montoro/plots/montoro.fullLength.receptors.nonzero.dp_sc.png", width=7, height=3, dpi=300)
+```

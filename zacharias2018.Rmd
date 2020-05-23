@@ -1,0 +1,102 @@
+---
+title: "Zacharias et al., 2018"
+output: html_notebook
+---
+
+Load libraries required for the further analysis.
+```{r message=FALSE}
+library(tidyverse)
+library(data.table)
+library(DESeq2)
+library(tximport)
+library(rhdf5)
+library(pheatmap)
+library(ggrepel)
+```
+
+Load mouse gene & transcript annotation from pre-comuputed files. The gene annotation used is GENCODE vM24. For pseudo-aligning reads to mouse transcriptome only transcripts longer than 200nt were used.
+```{r}
+annot_mouse <- fread("gencode.vM24.primary_assembly.annotation.gte.genes200.tx_gene_mapping.txt", 
+                       col.names=c("chr", "gene_id", "tx_id", "gene_type", "gene_name"),
+                       colClasses=c("factor", "character", "character", "factor", "character"))
+tx2gene_mouse <- dplyr::select(annot_mouse, TXNAME=tx_id, GENEID=gene_id)
+annot_mouse <- annot_mouse[,-3] %>% filter(!duplicated(.$gene_id))
+```
+
+Load kallisto expression estimates.
+```{r}
+zacharias.files <- list.files("zacharias/kallisto_quant", pattern="abundance.h5", full.names=T, recursive=T)
+zacharias.samples <- unlist(tstrsplit(zacharias.files, "/", keep=3))
+names(zacharias.files) <- zacharias.samples
+
+mouse.kallisto <- tximport(zacharias.files[str_detect(zacharias.files,"mouse")],
+                           type = "kallisto", txOut = FALSE, tx2gene = tx2gene_mouse)
+```
+
+Create a heatmap of virus entry factors (Ace2, Tmprss2, Furin, Anpep, Dpp4) expression values (TPM).
+```{r}
+mouse.kallisto.tpm <- mouse.kallisto$abundance %>% as.data.frame() %>%  
+  mutate(gene_id = row.names(.)) %>% 
+  merge(., annot_mouse[,c(2,4)], by="gene_id", all=F)
+
+receptors.m <- c("ENSMUSG00000015405.15", "ENSMUSG00000000385.8", "ENSMUSG00000030530.15", "ENSMUSG00000039062.15",
+                 "ENSMUSG00000035000.8")
+receptors.m <- c("Ace2", "Tmprss2", "Furin", "Anpep", "Dpp4")
+
+filter(mouse.kallisto.tpm, gene_name %in% c(receptors.m)) %>% 
+  dplyr::select(!gene_id) %>% 
+  melt() %>% 
+  ggplot() + 
+  geom_tile(mapping=aes(x=variable, y=factor(gene_name,
+                                             levels = rev(receptors.m)),
+                        fill=log2(value+1)), color="grey") + theme_minimal() +
+  labs(x="", y="", fill="log2(TPM+1)") + scale_fill_gradientn(colors=c("cornflowerblue", "yellow", "red")) +
+  geom_text(aes(x=variable, y=gene_name,label = round(value, 1))) + 
+  scale_x_discrete(labels = c("AEP", "AEP", "AT2", "AT2", "AT2")) +
+  theme(axis.text = element_text(size=12))
+# ggsave("zacharias/plots/mouse_TPM.hm.png", width=5, height=4, dpi=300)
+```
+
+Run differential gene expression analysis with DESeq2.
+```{r}
+mouse.pheno <- data.frame(sample=c("AEP", "AEP", "AT2", "AT2", "AT2"), 
+                           row.names=colnames(mouse.kallisto$counts))
+
+mouse.kallisto.dds <- DESeqDataSetFromTximport(mouse.kallisto, mouse.pheno, ~sample)
+mouse.kallisto.dds <- DESeq(mouse.kallisto.dds)
+
+mouse.kallisto.counts <- counts(mouse.kallisto.dds, normalized = TRUE) %>% as.data.frame()
+
+summary(results(mouse.kallisto.dds, contrast=c("sample", "AEP", "AT2"), alpha=0.05))
+mouse.kallisto.res <- results(mouse.kallisto.dds, contrast=c("sample", "AEP", "AT2"), alpha=0.05) %>% 
+  as.data.frame() %>% 
+  mutate(gene_id = rownames(.), FC = 2^log2FoldChange) %>%
+  filter(!is.na(padj)) %>% 
+  merge(., annot_mouse, by="gene_id", all=F) %>% 
+  dplyr::select(gene_id, gene_name, gene_type, chr, stat, padj, log2FC = log2FoldChange, FC) %>% 
+  arrange(desc(stat))
+# fwrite(mouse.kallisto.res, "zacharias/mouse.kallisto.res.txt", sep = "\t")
+
+mouse.kallisto.res %>% filter(gene_name %in% receptors.m)
+```
+
+Create volcano plot of AEP vs AT2 comparison.
+```{r}
+ggplot() + 
+  geom_point(mouse.kallisto.res[!(mouse.kallisto.res$gene_name %in% receptors.m),],
+             mapping=aes(x=log2FC, y=-log10(padj)), color="grey", alpha=0.1) +
+  geom_point(mouse.kallisto.res[(mouse.kallisto.res$gene_name %in% receptors.m)&(mouse.kallisto.res$padj>0.05),], 
+             mapping=aes(x=log2FC, y=-log10(padj)), color="pink", alpha=0.9) +
+  geom_point(mouse.kallisto.res[(mouse.kallisto.res$gene_name %in% receptors.m)&(mouse.kallisto.res$padj<0.05),], 
+             mapping=aes(x=log2FC, y=-log10(padj)), color="red", alpha=0.9) +
+  geom_vline(xintercept = 0, linetype="dashed", color="darkgrey") +
+  geom_hline(yintercept = -log10(0.05), linetype="dashed", color="darkgrey") +
+  geom_text_repel(mouse.kallisto.res[(mouse.kallisto.res$gene_name %in% receptors.m),], 
+             mapping=aes(x=log2FC, y=-log10(padj), label=gene_name), size = 3) +
+  xlim(c(-3,3)) + ylim(c(0, 10)) +
+  theme_classic() + theme(axis.text = element_text(color = "black"), aspect.ratio=1, text = element_text(size = 10)) +
+  labs(x=expression(log[2]~("Fold change")), y=expression(-log[10]~(p.adjusted)))
+# ggsave("zacharias/plots/mouse.kallisto.vlc.png", width=3, height=3, dpi=300)
+```
+
+

@@ -1,0 +1,157 @@
+---
+title: "Liu et al., 2019"
+output: html_notebook
+---
+
+Load libraries required for the further analysis.
+```{r message=FALSE}
+library(tidyverse)
+library(data.table)
+library(Seurat)
+library(patchwork)
+library(biomaRt)
+```
+
+Load mouse gene length annotation.
+```{r}
+mouse_ensembl_91 <- useMart(host='dec2017.archive.ensembl.org', 
+                     biomart='ENSEMBL_MART_ENSEMBL', 
+                     dataset='mmusculus_gene_ensembl')
+mouse_genes <- getBM(attributes=c("ensembl_gene_id", "external_gene_name", "chromosome_name"), #"start_position", "end_position"
+                     mart = mouse_ensembl_91) %>%
+   dplyr::rename(gene_id=ensembl_gene_id, gene_name=external_gene_name, chr=chromosome_name)
+
+mouse_gene_length <- fread("Mus_musculus.GRCm38.91.exons_merged.gene_length.txt", 
+                           col.names=c("gene_id", "gene_length"))
+mouse_gene_glength <- merge(mouse_genes, mouse_gene_length, by="gene_id", all=F)
+```
+
+Load the gene expression table and dataset metadata. Calculate log2(TPM+1) values.
+```{r}
+liu.counts <- fread("liu/GSE118891_all.single.cell.gene.counts.txt.gz", stringsAsFactors=FALSE)
+colnames(liu.counts) <- c("gene_id", colnames(liu.counts)[-length(colnames(liu.counts))])
+
+liu.counts_symbols <- merge(mouse_gene_glength[,c(1:2,4)], liu.counts, by="gene_id", all.x=F, all.y=T) %>% 
+  mutate(gene_name=ifelse(duplicated(gene_name), gene_id, gene_name))
+
+# calculate log2(TPM+1) values.
+liu.counts.m <- as.matrix(liu.counts_symbols[,-c(1:3)])
+rownames(liu.counts.m) <- liu.counts_symbols$gene_name
+liu.counts.rpk <- colSums(liu.counts.m/liu.counts_symbols$gene_length)
+liu.counts.tpm <- t(t(liu.counts.m/liu.counts_symbols$gene_length)/
+                                     liu.counts.rpk)*(10^6)
+liu.counts.m_log <- log2(t(t(liu.counts.m/liu.counts_symbols$gene_length)/
+                                     liu.counts.rpk)*(10^6)+1)
+# fwrite(liu.counts.m_log, "liu/liu.counts.m_log.txt", sep="\t")
+
+# load metadata
+liu.meta <- fread("liu/liu.biosample.list.parsed.txt", 
+                          header=F, col.names=c("plate", "source", "cell")) 
+row.names(liu.meta) <- liu.meta$plate
+```
+
+Create Seurat object, filter out low-quality cells.
+```{r}
+liu.seurat <- CreateSeuratObject(counts=liu.counts.m_log, project="BASCs", meta.data=liu.meta)
+
+# mito genes percentage
+liu.seurat[["percent.mt"]] <- PercentageFeatureSet(liu.seurat, pattern = "^mt-")
+VlnPlot(liu.seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+liu.seurat <- subset(liu.seurat, subset = nFeature_RNA > 2000 & nFeature_RNA < 7500 & percent.mt < 1.5)
+```
+
+Find 2000 highly variable genes (HVGs), scale the data based on these HVGs.
+Perform linear dimentional reduction (PCA) on 2000 HVGs.
+```{r}
+liu.seurat <- FindVariableFeatures(liu.seurat, selection.method = "vst", nfeatures = 2000)
+LabelPoints(plot = VariableFeaturePlot(liu.seurat), points = head(VariableFeatures(liu.seurat), 10), repel = TRUE)
+
+liu.seurat <- ScaleData(liu.seurat, features = rownames(liu.seurat))
+
+liu.seurat <- RunPCA(liu.seurat, features = VariableFeatures(object = liu.seurat))
+DimPlot(liu.seurat, reduction = "pca", group.by="cell")
+ElbowPlot(liu.seurat, ndims=30)
+```
+
+Use first 10 PCs for t-SNE and constructing SNN (Shared Nearest Neighbor) graph.
+```{r}
+liu.seurat <- RunTSNE(liu.seurat, dims = c(1:10), perplexity=30)
+
+liu.seurat <- FindNeighbors(liu.seurat, dims=c(1:10), k.param=20)
+liu.seurat <- FindClusters(liu.seurat, resolution = 0.5)
+
+DimPlot(liu.seurat, reduction = "tsne")
+DimPlot(liu.seurat, reduction = "tsne", group.by="cell")
+```
+
+Find marker genes and assign names to clusters.
+```{r}
+liu_markers <- FindAllMarkers(liu.seurat, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+# fwrite(liu_markers, "liu/liu_markers.txt", sep="\t")
+
+new.cluster.ids <- c("BASC", "AT2", "Club", "Ciliated")
+names(new.cluster.ids) <- levels(liu.seurat)
+liu.seurat <- RenameIdents(liu.seurat, new.cluster.ids)
+
+DimPlot(liu.seurat, reduction = "tsne", label = TRUE, label.size = 5) + NoLegend() + 
+  labs(x=expression(paste(italic("t"),"-SNE 1")), y=expression(paste(italic("t"),"-SNE 2"))) + 
+  theme(axis.text = element_text(color = "black", size = 10), aspect.ratio=1)
+# ggsave("liu/plots/liu.tsne.labels.png", width=4, height=4, dpi=300)
+```
+
+Save Seurat object.
+```{r}
+# saveRDS(liu.seurat, file = "liu/liu.seurat.Rds")
+# liu.seurat <- readRDS("liu/liu.seurat.Rds")
+```
+
+Calculate virus entry factors' average expression, average non-zero expression, and percent expressing cells in different cell types.
+```{r}
+receptors.m <- c("Ace2", "Tmprss2", "Furin", "Anpep", "Dpp4")
+
+liu.seurat <- SetAssayData(liu.seurat, slot="data", 
+                           new.data=log1p(liu.counts.tpm[,colnames(liu.counts.tpm) %in%
+                                                     liu.seurat@meta.data$plate]))
+
+liu.avg <- DotPlot(liu.seurat, features = receptors.m)$data %>% 
+  transmute(gene = factor(features.plot, levels = receptors.m), 
+            id = factor(id, levels = rev(c("BASC", "AT2", "Club", "Ciliated"))), 
+            avg.exp = log1p(avg.exp), pct.exp)
+# fwrite(liu.avg, "liu/liu.avg.txt", sep="\t")
+
+liu.sizes <- table(Idents(liu.seurat)) %>% as.data.frame() %>% rename(id = Var1, nCells = Freq)
+
+liu.avg_nonzero <- liu.avg %>% 
+  mutate(avg.exp = expm1(avg.exp)) %>% 
+  merge(., liu.sizes, by = "id", all = FALSE) %>% 
+  # calculate average non-zero expression  
+  mutate(avg.nonzero.exp = log1p(avg.exp * nCells / (pct.exp * nCells / 100)), avg.exp = log1p(avg.exp), 
+         avg.nonzero.exp = ifelse(is.nan(avg.nonzero.exp), 0, avg.nonzero.exp))
+# fwrite(liu.avg_nonzero, "liu/liu.avg_nonzero.txt", sep="\t")
+
+ggplot(liu.avg_nonzero, aes(x=gene, y=factor(id, levels = rev(c("BASC", "AT2", "Club", "Ciliated"))), 
+                                             color=avg.nonzero.exp, size=pct.exp)) + geom_point() +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nexpression\nlog(TPM+1)", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red", limits = c(0, max(liu.avg_nonzero$avg.nonzero.exp))) +  
+  scale_size_continuous(limits = c(20,100), breaks = c(20,40,60,80)) +
+  theme(axis.text.x = element_text(hjust=1, angle=45), 
+        legend.title = element_text(size = 6), legend.text = element_text(size = 6), legend.title.align = 0.5,
+        axis.text = element_text(color = "black", size = 8), aspect.ratio = 4/5) +
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3), 
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5)) 
+# ggsave("liu/plots/liu.receptors.nonzero.dp.png", width=4, height=4, dpi=300)
+```
+
+Plot BASC marker gene expression profile in t-SNE plot. 
+Sftpc is a AT2 cell marker, Scgb1a1 is a Club cell marker. Cells expressing both genes are identified as BASC.
+```{r}
+liu.basc_markers <- FeaturePlot(object=liu.seurat, features=c("Sftpc", "Scgb1a1"),
+            cols=c("lightgrey", "red", "blue"), reduction="tsne", blend=T, blend.threshold=0.5, combine = FALSE)
+
+liu.basc_markers[[1]] + liu.basc_markers[[2]] + liu.basc_markers[[3]] & 
+  theme(legend.position = "none", axis.text = element_text(color = "black", size = 10), 
+        aspect.ratio=1, plot.title = element_blank()) &
+  labs(x=expression(paste(italic("t"),"-SNE 1")), y=expression(paste(italic("t"),"-SNE 2")))
+# ggsave("liu/plots/liu.tsne.basc.png", width=12, height=4, dpi=300)
+```

@@ -1,0 +1,190 @@
+---
+title: "Wang et al., 2018"
+output: html_notebook
+---
+
+Load libraries required for the further analysis.
+```{r message=FALSE}
+library(tidyverse)
+library(data.table)
+library(reshape2)
+library(Seurat)
+library(patchwork)
+```
+
+Load the datasets: AT1 cells (P3, P15, and P60 populations) and AT2 cells (P60 only). Create Seurat objects.
+Expression tables contain log(TPM+1) values, scaling factor = 10000.
+```{r}
+wang.AT1_P3.data <- fread("wang/GSM2858339_AT1_P3.exprs.csv.gz")
+wang.AT1_P3.data_m <- as.matrix(wang.AT1_P3.data[,-1])
+rownames(wang.AT1_P3.data_m) <- wang.AT1_P3.data$V1
+
+wang.AT1_P15.data <- fread("wang/GSM2858340_AT1_P15.exprs.csv.gz")
+wang.AT1_P15.data_m <- as.matrix(wang.AT1_P15.data[,-1])
+rownames(wang.AT1_P15.data_m) <- wang.AT1_P15.data$V1
+
+wang.AT1_P60.data <- fread("wang/GSM2858341_AT1_P60.exprs.csv.gz")
+wang.AT1_P60.data_m <- as.matrix(wang.AT1_P60.data[,-1])
+rownames(wang.AT1_P60.data_m) <- wang.AT1_P60.data$V1
+
+wang.AT2_P60.data <- fread("wang/GSM2858342_AT2_P60.exprs.csv.gz")
+wang.AT2_P60.data_m <- as.matrix(wang.AT2_P60.data[,-1])
+rownames(wang.AT2_P60.data_m) <- wang.AT2_P60.data$V1
+
+wang.AT1_P3.seurat <- CreateSeuratObject(wang.AT1_P3.data_m, project="AT1_P3")
+wang.AT1_P15.seurat <- CreateSeuratObject(wang.AT1_P15.data_m, project="AT1_P15")
+wang.AT1_P60.seurat <- CreateSeuratObject(wang.AT1_P60.data_m, project="AT1_P60")
+wang.AT2_P60.seurat <- CreateSeuratObject(wang.AT2_P60.data_m, project="AT2_P60")
+```
+
+Make a list of AT1 cells datasets: P3, P15, P60.
+Explore AT1 cells: Hopx+/Igfbp2+ and Hopx+/Igfbp2- subpopulations.
+```{r}
+# label Igfbp+/Igfbp2- AT1 cells
+wang.AT1.list <- list(wang.AT1_P3.seurat, wang.AT1_P15.seurat, wang.AT1_P60.seurat)
+for (k in 1:length(wang.AT1.list)){
+  wang.AT1.list[[k]] <- SetIdent(wang.AT1.list[[k]], 
+                                cells = WhichCells(wang.AT1.list[[k]], expression = Hopx > 0 & Igfbp2 == 0), 
+                                value = "Hopx+/Igfbp2-")
+  wang.AT1.list[[k]] <- SetIdent(wang.AT1.list[[k]], 
+                                cells = WhichCells(wang.AT1.list[[k]], expression = Hopx > 0 & Igfbp2 > 0), 
+                                value = "Hopx+/Igfbp2+")
+  wang.AT1.list[[k]] <- SetIdent(wang.AT1.list[[k]], 
+                                cells = WhichCells(wang.AT1.list[[k]], expression = Hopx == 0), 
+                                value = "Hopx-")
+}
+
+# number of Hopx+/Igfbp2- cells decreases with age
+wang.AT1.table <- data.frame(P3=table(Idents(wang.AT1.list[[1]])), P15=table(Idents(wang.AT1.list[[2]])),
+           P60=table(Idents(wang.AT1.list[[3]]))) %>% select(cell=P3.Var1, P3=P3.Freq, P15=P15.Freq, P60=P60.Freq) %>% 
+  reshape2::melt() %>% group_by(variable) %>% mutate(percent = value/sum(value)*100)
+ggplot(wang.AT1.table, aes(x=cell, y=variable, fill=percent, label=round(percent, 1))) + geom_tile(color="grey") +
+  geom_text() + scale_fill_gradientn(colours = c("lightblue", "pink")) + theme_minimal() + labs(x="", y="")
+
+FeatureScatter(wang.AT1.list[[1]], "Hopx", "Igfbp2") + NoLegend() + labs(color="") + ggtitle(label="P3") + ylim(c(0,5)) +
+  FeatureScatter(wang.AT1.list[[2]], "Hopx", "Igfbp2") + NoLegend() + labs(color="") + ggtitle(label="P15") + ylim(c(0,5)) +
+  theme(axis.title.y = element_blank(), axis.line.y = element_blank(), 
+        axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+  FeatureScatter(wang.AT1.list[[2]], "Hopx", "Igfbp2") + labs(color="") + ggtitle(label="P60") +  ylim(c(0,5)) +
+  theme(axis.title.y = element_blank(), axis.line.y = element_blank(), 
+        axis.text.y = element_blank(), axis.ticks.y = element_blank())
+```
+
+Calculate virus entry factors' average expression, average no-zero expression, and percent expressing cells in AT1 Hopx+/Igfbp+ and Hopx+/Igfbp- subpopulations.
+```{r}
+receptors.m <- c("Ace2", "Tmprss2", "Furin", "Anpep", "Dpp4")
+wang.AT1_P3.avg <- DotPlot(wang.AT1.list[[1]], features = receptors.m)$data %>% 
+  transmute(gene = features.plot, id, avg.exp = log1p(avg.exp), pct.exp)
+wang.AT1_P15.avg <- DotPlot(wang.AT1.list[[2]], features = receptors.m)$data %>% 
+  transmute(gene = features.plot, id, avg.exp = log1p(avg.exp), pct.exp)
+wang.AT1_P60.avg <- DotPlot(wang.AT1.list[[2]], features = receptors.m)$data %>% 
+  transmute(gene = features.plot, id, avg.exp = log1p(avg.exp), pct.exp)
+wang.AT1.avg <- merge(wang.AT1_P3.avg, wang.AT1_P15.avg, by=c("gene", "id"), all=T, suffixes = c(".P3", ".P15")) %>% 
+  merge(., wang.AT1_P60.avg, by=c("gene", "id"), all=T)
+wang.AT1.avg[is.na(wang.AT1.avg)] <- 0
+
+wang.AT1.avg.melted <- merge(mutate(reshape2::melt(wang.AT1.avg[,c(1:3,5,7)]),
+             variable=case_when(variable=="avg.exp.P3" ~ "P3", variable == "avg.exp.P15" ~ "P15", TRUE ~ "P60")),
+      mutate(reshape2::melt(wang.AT1.avg[,c(1:2,4,6,8)]), 
+             variable=case_when(variable=="pct.exp.P3" ~ "P3", variable == "pct.exp.P15" ~ "P15", TRUE ~ "P60")),
+      by=c("gene", "id", "variable"), all=T, suffixes = c(".exp", ".pct")) %>% 
+  mutate(variable=factor(variable, levels = c("P3", "P15", "P60")))
+# fwrite(wang.AT1.avg.melted, "wang/wang.AT1.avg.melted.txt", sep="\t")
+
+# calculate subpopulations' sizes
+cluster_sizes.AT1 <- rbind(as.data.frame(table(Idents(wang.AT1.list[[1]]))), as.data.frame(table(Idents(wang.AT1.list[[2]]))),
+                           as.data.frame(table(Idents(wang.AT1.list[[3]])))) %>% 
+  transmute(id = Var1, variable = rep(c("P3", "P15", "P60"), each = 3), nCells = Freq)
+
+wang.AT1.avg.melted_nonzero <- merge(wang.AT1.avg.melted, cluster_sizes.AT1, by = c("id", "variable"), all = TRUE) %>% 
+  mutate(avg.nonzero.exp = log1p(expm1(value.exp) * nCells / (value.pct * nCells / 100)),
+         avg.nonzero.exp = ifelse(is.nan(avg.nonzero.exp), 0, avg.nonzero.exp))
+# fwrite(wang.AT1.avg.melted_nonzero, "wang/wang.AT1.avg.melted_nonzero.txt", sep="\t")
+
+ggplot(filter(wang.AT1.avg.melted_nonzero, id != "Hopx-"), 
+       aes(x=factor(id, levels = c("Hopx+/Igfbp2-", "Hopx+/Igfbp2+")), 
+           y=factor(gene, levels = rev(receptors.m)), color=avg.nonzero.exp, size=value.pct)) + 
+  geom_point() +
+  facet_wrap(~variable) +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nexpression\nlog(TPM+1)", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red") +
+  scale_x_discrete(labels = c("Hopx+/Igfbp2-" = expression(paste("Hopx"^"+", "/Igfbp2"^"-", " AT1")),
+                              "Hopx+/Igfbp2+" = expression(paste("Hopx"^"+", "/Igfbp2"^"+", " AT1")))) +
+  theme(axis.text.x = element_text(angle=45, hjust=1), legend.title = element_text(size = 6), 
+        legend.text = element_text(size = 6), legend.title.align = 0.5,
+        axis.text = element_text(color = "black", size = 8), 
+        strip.text = element_text(size = 10)) +
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3),
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5))
+# ggsave("wang/plots/wang.AT1.avg.nonzero.dp1.png", width=5, height=4, dpi=300)
+
+# plot only P60 dataset
+ggplot(filter(wang.AT1.avg.melted_nonzero, id != "Hopx-", variable == "P60"), 
+       aes(x=factor(id, levels = c("Hopx+/Igfbp2-", "Hopx+/Igfbp2+")), 
+           y=factor(gene, levels = rev(receptors.m)), color=avg.nonzero.exp, size=value.pct)) + 
+  geom_point() +
+  facet_wrap(~variable) +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nexpression\nlog(TPM+1)", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red") +
+  scale_x_discrete(labels = c("Hopx+/Igfbp2-" = expression(paste("Hopx"^"+", "/Igfbp2"^"-", " AT1")),
+                              "Hopx+/Igfbp2+" = expression(paste("Hopx"^"+", "/Igfbp2"^"+", " AT1")))) +
+  theme(axis.text.x = element_text(angle=45, hjust=1), legend.title = element_text(size = 6), 
+        legend.text = element_text(size = 6), legend.title.align = 0.5,
+        axis.text = element_text(color = "black", size = 8), 
+        strip.text = element_text(size = 10)) +
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3),
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5))
+# ggsave("wang/plots/wang.AT1.avg.nonzero.dp2.png", width=3, height=4, dpi=300)
+```
+
+
+Explore AT2 cells: Axin2+ and Axin2- subpopulations.
+Calculate virus entry factors' average expression, average no-zero expression, and percent expressing cells in AT2 subpopulations.
+```{r}
+# label Axin2+/Axin2- AT2 cells
+wang.AT2_P60.seurat <- SetIdent(wang.AT2_P60.seurat, 
+                                cells = WhichCells(wang.AT2_P60.seurat, expression = Axin2 > 0), value = "Axin2+")
+wang.AT2_P60.seurat <- SetIdent(wang.AT2_P60.seurat, 
+                                cells = WhichCells(wang.AT2_P60.seurat, expression = Axin2 == 0), value = "Axin2-")
+
+cluster_sizes.AT2 <- table(Idents(wang.AT2_P60.seurat)) %>% as.data.frame() %>% rename(id = Var1, nCells = Freq)
+wang.AT2_P60.avg <- DotPlot(wang.AT2_P60.seurat, features = receptors.m)$data %>% 
+  transmute(gene = factor(features.plot, levels = rev(receptors.m)), id = factor(id, levels = c("Axin2+", "Axin2-")), 
+            avg.exp, pct.exp) %>% 
+  merge(., cluster_sizes.AT2, by = "id", all = FALSE) %>% 
+  # calculate average non-zero expression  
+  mutate(avg.nonzero.exp = log1p(avg.exp * nCells / (pct.exp * nCells / 100)), avg.exp = log1p(avg.exp))
+# fwrite(wang.AT2_P60.avg, "wang/wang.AT2_P60.avg.txt", sep="\t")
+
+ggplot(wang.AT2_P60.avg, aes(x=id, y=gene, fill=avg.exp, label=round(expm1(avg.exp),2))) + geom_tile(color="grey") +
+  geom_text() + scale_fill_gradientn(colours = c("lightblue", "darkblue")) + theme_minimal() + 
+  labs(x="", y="", fill="average\nlog(TPM+1)")
+# ggsave("wang/plots/wang.AT2_P60.avg.hm.png", width=4, height=3, dpi=300)
+
+FeatureScatter(wang.AT2_P60.seurat, "Sftpc", "Axin2") + labs(color="") + ggtitle(label="") + theme(legend.position = "top") +
+  FeatureScatter(wang.AT2_P60.seurat, "Ace2", "Tmprss2") + NoLegend() + facet_wrap(~colors) + ggtitle(label="")
+# ggsave("wang/plots/wang.AT2_P60.axin2.png", width=8, height=4, dpi=300)
+```
+
+Visualize virus entry factors' average expression and percent expressing cells in AT2 Axin2+ and Axin2- subpopulations.
+```{r}
+wang.AT2_P60.avg <- mutate(wang.AT2_P60.avg, id = factor(id, levels = c("Axin2+", "Axin2-")), 
+                           gene = factor(gene, levels = rev(receptors.m)))
+
+# non-zero expression
+ggplot(wang.AT2_P60.avg, aes(x=id, y=gene, color=avg.nonzero.exp, size=pct.exp)) + geom_point() +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nexpression\nlog(TPM+1)", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red") +
+  scale_size_continuous(limits = c(0, max(wang.AT2_P60.avg$pct.exp)), breaks = c(0,15,30,45)) +
+  scale_x_discrete(labels = c("Axin2+" = expression(paste("Axin2"^"+", " AT2")), 
+                              "Axin2-" = expression(paste("Axin2"^"-", " AT2")))) +
+  theme(axis.text.x = element_text(angle=45, hjust=1), legend.title = element_text(size = 6), 
+        legend.text = element_text(size = 6), legend.title.align = 0.5,
+        axis.text = element_text(color = "black", size = 8), 
+        strip.text = element_text(size = 10)) +
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3),
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5))
+# ggsave("wang/plots/wang.AT2_P60.avg.nonzero.dp1.png", width=3, height=4, dpi=300)
+```
+
+

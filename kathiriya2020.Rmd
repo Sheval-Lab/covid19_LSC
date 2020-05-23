@@ -1,0 +1,180 @@
+---
+title: "Kathiriya et al., 2020"
+output: html_notebook
+---
+
+Load libraries required for the further analysis.
+```{r message=FALSE}
+library(tidyverse)
+library(data.table)
+library(Seurat)
+```
+
+Load the scRNA-seq dataset of uninjured distal lung airway epithelium into Seurat object. 
+Inspect the data and filter it based on nFeature and percent.mt metrics.
+```{r}
+kath.seurat <- CreateSeuratObject(Read10X("kathiriya/non-injured/"), project="kathiriya.uninj",
+                                  min.cells = 3, min.features = 200)
+
+# mito genes percentage
+kath.seurat[["percent.mt"]] <- PercentageFeatureSet(kath.seurat, pattern = "^mt-")
+
+VlnPlot(kath.seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+kath.seurat <- subset(kath.seurat, subset = percent.mt < 10 & nFeature_RNA > 1000)
+VlnPlot(kath.seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+Normalize the data and find 2000 highly variable genes (HVGs).
+```{r}
+kath.seurat <- NormalizeData(kath.seurat, scale.factor = 100000)
+kath.seurat <- FindVariableFeatures(kath.seurat, selection.method = "vst", nfeatures = 2000)
+
+LabelPoints(plot = VariableFeaturePlot(kath.seurat), points = head(VariableFeatures(kath.seurat), 10), repel = TRUE)
+```
+
+Scale the data and perform linear dimentional reduction (PCA) on HVGs. 
+Inspect the elbow plot to select PCs for the further analysis.
+```{r}
+kath.seurat <- ScaleData(kath.seurat, features = rownames(kath.seurat), 
+                         vars.to.regress = c("nCount_RNA", "perecent.mt"))
+
+kath.seurat <- RunPCA(kath.seurat, features = VariableFeatures(object = kath.seurat))
+ElbowPlot(kath.seurat, ndims=30)
+```
+
+Run t-SNE (t-distributed Stochastic Neighbor Embedding) on first 8 PCs.
+```{r}
+kath.seurat <- RunTSNE(kath.seurat, dims = 1:8, perplexity = 50)
+DimPlot(kath.seurat, reduction = "tsne")
+
+kath.seurat <- FindNeighbors(kath.seurat, dims = 1:8, k.param = 20)
+kath.seurat <- FindClusters(kath.seurat, resolution = 0.4)
+DimPlot(kath.seurat, reduction = "tsne", label = TRUE) + NoLegend() + labs(x = "t-SNE 1", y = "t-SNE 2")
+# ggsave("kathiriya/plots/kath.non-inj.tsne.png", width=5, height=4, dpi=300)
+
+
+# cluster 8 contains H2-K1^high like cells
+# H2-K1, AW112010, Retnla, H2-Ab1 - H2-K1 high cell marker
+FeaturePlot(kath.seurat, features = c("H2-K1", "AW112010", "Retnla", "Ly6a"), min.cutoff = "q10")  & 
+  labs(x = "t-SNE 1", y = "t-SNE 2")
+```
+
+Identify clusters' marker genes and rename clusters.
+```{r}
+kath_markers <- FindAllMarkers(kath.seurat, only.pos = TRUE, test.use = "MAST")
+# fwrite(kath_markers, "kathiriya/kath.non-inj.markers.txt", sep="\t")
+# kath_markers %>% filter(p_val_adj<0.05) %>% group_by(cluster) %>% top_n(n = 100, wt = avg_logFC) %>% 
+#   fwrite("kathiriya/kath.non-inj.markers100.txt", sep="\t")
+kath_markers %>% filter(p_val_adj<0.05) %>% group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+
+kath.cluster.ids <- c("Club", "Club", "Ciliated", "AT2", "Ciliated", "Club", "Club", "Endothelial", "Club", "Cycling basal")
+names(kath.cluster.ids) <- levels(kath.seurat)
+kath.seurat <- RenameIdents(kath.seurat, kath.cluster.ids)
+
+DimPlot(kath.seurat, reduction = "tsne", label = TRUE) + NoLegend() + labs(x = "t-SNE 1", y = "t-SNE 2")
+# ggsave("kathiriya/plots/kath.non-inj.tsne.labels.png", width=5, height=4, dpi=300)
+
+kath_markers_top5 <- kath_markers %>% filter(p_val_adj<0.05) %>% group_by(cluster) %>% top_n(n = 5, wt = avg_logFC)
+DoHeatmap(kath.seurat, features = kath_markers_top5$gene, group.by = "seurat_clusters")
+```
+
+Select only club cells clusters.
+Identify 2000 HVGs and scale the data.
+Run PCA (dimentional reduction) based on HGVs and Sox9-associated progenitor genes (Ostrin et al., 2018).
+```{r}
+kath.club <- subset(kath.seurat, idents = "Club")
+
+kath.club <- FindVariableFeatures(kath.club, selection.method = "vst", nfeatures = 2000)
+kath.club <- ScaleData(kath.club, features = rownames(kath.club), vars.to.regress = c("nCount_RNA", "percent.mt"))
+
+
+# load the list of Sox9-associated progenitor genes
+sox9_genes.list <- fread("kathiriya/progenitor_genes.txt")$Symbol
+sox9_genes.list <- sox9_genes.list[sox9_genes.list %in% rownames(kath.club)]
+
+kath.club <- RunPCA(kath.club, features = c(VariableFeatures(kath.club), sox9_genes.list)) 
+ElbowPlot(kath.club, ndims=50)
+```
+
+Use first 10 PCs for t-SNE and constructing SNN (Shared Nearest Neighbor) graph. Identify clusters.
+```{r}
+kath.club <- RunTSNE(kath.club, dims = 1:10, perplexity=50)
+
+kath.club <- FindNeighbors(kath.club, dims = 1:10, k.param=20)
+kath.club <- FindClusters(kath.club, resolution = 0.5)
+
+DimPlot(kath.club, reduction = "tsne", label = TRUE, label.size = 6) + NoLegend() + 
+  labs(x=expression(paste(italic("t"),"-SNE 1")), y=expression(paste(italic("t"),"-SNE 2"))) + 
+  theme(axis.text = element_text(color = "black", size = 10), aspect.ratio=1)
+# ggsave("kathiriya/plots/kath.non-inj.club.tsne.png", width=4, height=4, dpi=300)
+
+# visualize expression of progenitor genes across the clusters
+kath.club_sox9 <- DotPlot(kath.club, features = sox9_genes.list)$data
+ggplot(kath.club_sox9, aes(x=features.plot, y=id, color=avg.exp.scaled, size=pct.exp)) + geom_point() +
+  theme_classic() + labs(x="", y="Cluster ID", color="Scaled average\nexpression", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "grey", high = "blue") +
+  guides(color = guide_colorbar(order = 1, barwidth = 1, barheight = 5, 
+                                title.theme = element_text(size = 10)),
+         size = guide_legend(order = 2, keywidth = 1, keyheight = 1,
+                             title.theme = element_text(size = 10))) +
+  theme(legend.title = element_text(size = 6), 
+        legend.text = element_text(size = 6), legend.title.align = 0.5,
+        axis.text = element_text(color = "black", size = 8)) +
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3),
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5))
+# ggsave("kathiriya/plots/kath.non-inj.club.sox9.dp.png", width=10, height=4, dpi=300)
+
+# cluster 6 is enriched with H2-K1/AW112010/Cd14/Cd74 expressing cells (29 cells in total)
+kath.club.dp_markers <- DotPlot(kath.club, features = c("Sftpc", "Scgb1a1", "Scgb3a2", "Cd74", "Cd14", "H2-K1", "AW112010"), 
+        group.by = "seurat_clusters")$data 
+ggplot(kath.club.dp_markers, aes(x=id, y=features.plot, color=avg.exp.scaled, size=pct.exp)) + geom_point() +
+  theme_classic() + labs(x="Cluster ID", y="", color="Scaled average\nexpression", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "grey", high = "blue") +
+  guides(color = guide_colorbar(order = 1, barwidth = 1, barheight = 5, 
+                                title.theme = element_text(size = 10)),
+         size = guide_legend(order = 2, keywidth = 1, keyheight = 1,
+                             title.theme = element_text(size = 10))) +
+  theme(legend.title = element_text(size = 6), 
+        legend.text = element_text(size = 6), legend.title.align = 0.5,
+        axis.text = element_text(color = "black", size = 8), 
+        aspect.ratio = 2/3) +
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3),
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5))
+# ggsave("kathiriya/plots/kath.non-inj.club.markers.dp.png", width=5, height=4, dpi=300)
+```
+
+Save Seurat objects.
+```{r}
+# saveRDS(kath.seurat, "kathiriya/kath.seurat.Rds")
+# saveRDS(kath.club, "kathiriya/kath.club.Rds")
+# 
+# kath.seurat <- readRDS("kathiriya/kath.seurat.Rds")
+# kath.club <- readRDS("kathiriya/kath.club.Rds")
+```
+
+Inspect SARS-CoV-2 entry factors (SEFs) average non-zero expression, cell coverage and plot dotplot.
+```{r}
+receptors.m <- c("Ace2", "Tmprss2", "Furin", "Anpep", "Dpp4")
+
+cluster_sizes <- table(Idents(kath.club)) %>% as.data.frame() %>% rename(id = Var1, nCells = Freq)
+kath.club.avg <- DotPlot(kath.club, features = receptors.m)$data %>% 
+  transmute(gene = factor(features.plot, levels = c("Ace2", "Tmprss2", "Furin", "Anpep", "Dpp4", "Bsg")), 
+            id = factor(id, levels = rev(levels(id))), avg.exp, pct.exp) %>% 
+  merge(., cluster_sizes, by = "id", all = FALSE) %>% 
+  # calculate average non-zero expression  
+  mutate(avg.nonzero.exp = log1p(avg.exp * nCells / (pct.exp * nCells / 100)), avg.exp = log1p(avg.exp))
+# fwrite(kath.club.avg, "kathiriya/kath.club.avg.txt", sep="\t")
+kath.club.avg <- mutate(kath.club.avg, gene = factor(gene, levels = receptors.m))
+
+ggplot(kath.club.avg, aes(x=gene, y=factor(id, levels = rev(0:6)), color=avg.nonzero.exp, size=pct.exp)) + geom_point() +
+  theme_classic() + labs(x="", y="Cluster ID", color="Average non-zero\nexpression\nlog(TPM+1)", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red", limits = c(0, max(kath.club.avg$avg.nonzero.exp))) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), legend.title = element_text(size = 6), 
+        legend.text = element_text(size = 6), legend.title.align = 0.5,
+        axis.text = element_text(color = "black", size = 8), 
+        aspect.ratio = 2/3) +
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3),
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5))
+# ggsave("kathiriya/plots/kath.club.receptors.nonzero.dp.png", width=5, height=4, dpi=300)
+```
+
