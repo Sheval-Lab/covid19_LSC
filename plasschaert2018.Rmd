@@ -1,0 +1,168 @@
+---
+title: "Plasschaert et al., 2018"
+output: html_notebook
+---
+
+Load libraries required for the further analysis.
+```{r message=FALSE}
+library(tidyverse)
+library(data.table)
+library(Seurat)
+library(patchwork)
+```
+
+Load the datasets: human bronchial cells.
+The data is normalized by library size and scaled by the mean library size.
+Create Seurat object. Assign cell type identities stored in meta data.
+```{r}
+plasschaert.human.data <- fread("plasschaert/GSE102580_filtered_normalized_counts_human.tsv.gz", 
+                                skip=1, header=T, col.names=c("gene", paste0("cell_", c(0:2969))))
+plasschaert.human.data_m <- as.matrix(plasschaert.human.data[,-1])
+rownames(plasschaert.human.data_m) <- plasschaert.human.data$gene
+
+plasschaert.human.meta <- fread("plasschaert/GSE102580_meta_filtered_counts_human.tsv.gz", skip=6)
+row.names(plasschaert.human.meta) <- paste0("cell_", plasschaert.human.meta$V1)
+
+plasschaert.human.seurat <- CreateSeuratObject(counts = log1p(plasschaert.human.data_m), project = "human_bronchi",
+                                               meta.data = plasschaert.human.meta)
+Idents(plasschaert.human.seurat) <- "clusters_Fig1"
+```
+
+Load the dataset: mouse trachea. Select only uninjured cells.
+The data is normalized by library size and scaled by the mean library size.
+Create Seurat object. Assign cell type identities stored in meta data.
+```{r}
+plasschaert.mouse.data <- fread("plasschaert/GSE102580_filtered_normalized_counts_mouse.tsv.gz", skip=2,
+                                 col.names=c("gene", paste0("cell_", c(0:14162))))
+
+plasschaert.mouse.meta <- fread("plasschaert/GSE102580_meta_filtered_counts_mouse.tsv.gz", skip=9)
+plasschaert.mouse.uninj.meta <- filter(plasschaert.mouse.meta, timepoint=="uninjured", clusters_Fig1!="")
+plasschaert.mouse.uninj.meta$cell <- paste0("cell_", plasschaert.mouse.uninj.meta$V1)
+row.names(plasschaert.mouse.uninj.meta) <- plasschaert.mouse.uninj.meta$cell
+
+
+plasschaert.mouse.data <- plasschaert.mouse.data %>% 
+  select(gene, one_of(plasschaert.mouse.uninj.meta$cell))
+plasschaert.mouse.data_m <- as.matrix(plasschaert.mouse.data[,-1])
+rownames(plasschaert.mouse.data_m) <- plasschaert.mouse.data$gene
+
+plasschaert.mouse.seurat <- CreateSeuratObject(counts = log1p(plasschaert.mouse.data_m), project = "mouse_trachea",
+                                               meta.data = plasschaert.mouse.uninj.meta)
+Idents(plasschaert.mouse.seurat) <- "clusters_Fig1"
+```
+
+For SEFs in human bronchial cells dataset calculate average gene expression, average non-zero expression, and percent of cells expressing the gene.
+Create two dotplots: for low expressed ACE2 and other SEFs.
+```{r}
+receptors.h <- c("ACE2", "TMPRSS2", "FURIN", "ANPEP", "DPP4")
+plasschaert.human.sizes <- table(Idents(plasschaert.human.seurat)) %>% as.data.frame() %>% 
+  rename(id = Var1, nCells = Freq) %>% filter(id %in% c("Basal", "Secretory", "Ciliated"))
+
+plasschaert.human.receptors <- DotPlot(plasschaert.human.seurat, features = receptors.h)$data %>% 
+  filter(id %in% c("Basal", "Secretory", "Ciliated")) %>% 
+  merge(., plasschaert.human.sizes, by = "id", all = FALSE) %>% 
+  transmute(gene = features.plot, id = factor(id, levels = rev(c("Basal", "Secretory", "Ciliated"))), 
+            avg.nonzero.exp = log1p(avg.exp * nCells / (pct.exp * nCells / 100)), 
+            avg.nonzero.exp = ifelse(is.nan(avg.nonzero.exp), 0, avg.nonzero.exp),
+            avg.exp = log1p(avg.exp), pct.exp)
+# fwrite(plasschaert.human.receptors, "plasschaert/plasschaert.human.receptors.txt", sep="\t")
+
+human_plot1 <- ggplot(filter(plasschaert.human.receptors, gene %in% c("ACE2")), 
+                aes(x=gene, y=factor(id, levels = rev(c("Basal", "Secretory", "Ciliated"))), 
+                    color=avg.nonzero.exp, size=pct.exp)) +
+  geom_point() +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nnormalized\nexpression", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red", 
+                       limits = c(0, max(filter(plasschaert.human.receptors, gene %in% c("ACE2"))$avg.nonzero.exp,
+                                         filter(plasschaert.mouse.receptors, gene %in% c("Ace2"))$avg.nonzero.exp))) +
+  scale_size_continuous(limits = c(0, max(filter(plasschaert.human.receptors, gene %in% c("ACE2"))$pct.exp,
+                                          filter(plasschaert.mouse.receptors, gene %in% c("Ace2"))$pct.exp)), 
+                        breaks = c(0,5,10,15)) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), axis.text = element_text(color = "black", size = 8), 
+        legend.title = element_text(size = 6),  legend.text = element_text(size = 6), legend.title.align = 0.5) +
+  guides(color = guide_colorbar(order = 1), size = guide_legend(order = 2))
+
+
+human_plot2 <- ggplot(filter(plasschaert.human.receptors, gene %in% c("TMPRSS2", "FURIN", "ANPEP", "DPP4")), 
+       aes(x=factor(gene, levels = c("TMPRSS2", "FURIN", "ANPEP", "DPP4")), 
+           y=factor(id, levels = rev(c("Basal", "Secretory", "Ciliated"))), color=avg.nonzero.exp, size=pct.exp)) +
+  geom_point() +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nnormalized\nexpression", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red", 
+                       limits = c(0, max(plasschaert.human.receptors$avg.nonzero.exp,
+                                         plasschaert.mouse.receptors$avg.nonzero.exp))) +
+  scale_size_continuous(limits = c(0, max(plasschaert.human.receptors$pct.exp, plasschaert.mouse.receptors$pct.exp)), 
+                        breaks = c(0,15,30,45)) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), axis.text = element_text(color = "black", size = 8), 
+        legend.title = element_text(size = 6),  legend.text = element_text(size = 6), legend.title.align = 0.5) +
+  guides(color = guide_colorbar(order = 1), size = guide_legend(order = 2))
+
+
+human_plot1 + 
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3), 
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5)) +
+  human_plot2 + 
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3), 
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5)) + 
+  plot_layout(widths = c(1, 2))
+# ggsave("plasschaert/plots/plasschaert.human.receptors.nonzero.dp.png", width=7, height=3, dpi=300)
+```
+
+For SEFs in mouse trachea dataset calculate average gene expression, average non-zero expression, and percent of cells expressing the gene.
+Create two dotplots: for low expressed Ace2 and other SEFs.
+```{r}
+receptors.m <- c("Ace2", "Tmprss2", "Furin", "Anpep", "Dpp4")
+plasschaert.mouse.sizes <- table(Idents(plasschaert.mouse.seurat)) %>% as.data.frame() %>% 
+  rename(id = Var1, nCells = Freq) %>% filter(id %in% c("Basal", "Secretory", "Ciliated"))
+
+plasschaert.mouse.receptors <- DotPlot(plasschaert.mouse.seurat, features = receptors.m)$data %>% 
+  filter(id %in% c("Basal", "Secretory", "Ciliated")) %>% 
+  merge(., plasschaert.mouse.sizes, by = "id", all = FALSE) %>% 
+  transmute(gene = features.plot, id = factor(id, levels = rev(c("Basal", "Secretory", "Ciliated"))), 
+            avg.nonzero.exp = log1p(avg.exp * nCells / (pct.exp * nCells / 100)), 
+            avg.nonzero.exp = ifelse(is.nan(avg.nonzero.exp), 0, avg.nonzero.exp),
+            avg.exp = log1p(avg.exp), pct.exp)
+# fwrite(plasschaert.mouse.receptors, "plasschaert/plasschaert.mouse.receptors.txt", sep="\t")
+
+
+mouse_plot1 <- ggplot(filter(plasschaert.mouse.receptors, gene %in% c("Ace2")), 
+                aes(x=gene, y=factor(id, levels = rev(c("Basal", "Secretory", "Ciliated"))), 
+                    color=avg.nonzero.exp, size=pct.exp)) +
+  geom_point() +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nnormalized\nexpression", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red", 
+                       limits = c(0, max(filter(plasschaert.human.receptors, gene %in% c("ACE2"))$avg.nonzero.exp,
+                                         filter(plasschaert.mouse.receptors, gene %in% c("Ace2"))$avg.nonzero.exp))) +
+  scale_size_continuous(limits = c(0, max(filter(plasschaert.human.receptors, gene %in% c("ACE2"))$pct.exp,
+                                          filter(plasschaert.mouse.receptors, gene %in% c("Ace2"))$pct.exp)), 
+                        breaks = c(0,5,10,15)) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), axis.text = element_text(color = "black", size = 8), 
+        legend.title = element_text(size = 6),  legend.text = element_text(size = 6), legend.title.align = 0.5) +
+  guides(color = guide_colorbar(order = 1), size = guide_legend(order = 2))
+
+
+mouse_plot2 <- ggplot(filter(plasschaert.mouse.receptors, gene %in% c("Tmprss2", "Furin", "Anpep", "Dpp4")), 
+       aes(x=factor(gene, levels = c("Tmprss2", "Furin", "Anpep", "Dpp4")), 
+           y=factor(id, levels = rev(c("Basal", "Secretory", "Ciliated"))), color=avg.nonzero.exp, size=pct.exp)) +
+  geom_point() +
+  theme_classic() + labs(x="", y="", color="Average non-zero\nnormalized\nexpression", size="Percent\nexpressed") + 
+  scale_color_gradient(low = "blue", high = "red", 
+                       limits = c(0, max(plasschaert.human.receptors$avg.nonzero.exp,
+                                         plasschaert.mouse.receptors$avg.nonzero.exp))) +
+  scale_size_continuous(limits = c(0, max(plasschaert.human.receptors$pct.exp, plasschaert.mouse.receptors$pct.exp)), 
+                        breaks = c(0,15,30,45)) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), axis.text = element_text(color = "black", size = 8), 
+        legend.title = element_text(size = 6),  legend.text = element_text(size = 6), legend.title.align = 0.5) +
+  guides(color = guide_colorbar(order = 1), size = guide_legend(order = 2))
+
+
+mouse_plot1 + 
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3), 
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5)) +
+  mouse_plot2 + 
+  guides(color = guide_colorbar(order = 1, barwidth = 0.7, barheight = 3), 
+         size = guide_legend(order = 2, keywidth = 0.5, keyheight = 0.5)) + 
+  plot_layout(widths = c(1, 2))
+# ggsave("plasschaert/plots/plasschaert.mouse.receptors.nonzero.dp.png", width=7, height=3, dpi=300)
+```
+
