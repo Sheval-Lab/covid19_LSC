@@ -1,3 +1,3 @@
-# covid19_LSC
+# Lung epithelial stem cells express SARS-CoV-2 entry factors: implications for COVID-19
 
-The project is aimed to assess the ability of SARS-CoV-2 to infect lung stem cells.
+This repository stores R notebooks and additional annotation files used in "Lung epithelial stem cells express SARS-CoV-2 entry factors: implications for COVID-19" publication.
